@@ -1,0 +1,1368 @@
+<!--
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  ALTAR — Who Goes First?                                     ║
+  ║  v1.0.0 — board-game first-player selector                   ║
+  ║                                                              ║
+  ║  Single-file. Zero dependencies. Works offline after load.   ║
+  ║  Designed for phones & tablets laid flat on a game table.    ║
+  ║                                                              ║
+  ║  HOW IT WORKS                                                ║
+  ║  1. Screensaver — ghost fingerprints drift across the screen  ║
+  ║     inviting players to touch without needing instructions.  ║
+  ║  2. Collecting — each finger gets a colored fingerprint +    ║
+  ║     sonar ring. A perimeter countdown timer drains. Timer    ║
+  ║     resets on every new touch so late players can join.      ║
+  ║  3. Locked — timer hits zero, selection begins.              ║
+  ║  4. Selecting — slot-machine animation cycles through all    ║
+  ║     fingers with exponential slowdown. Winner is chosen by   ║
+  ║     Math.random() before the animation starts.               ║
+  ║  5. Winner — chosen finger throbs, losers shrink away.       ║
+  ║     "▲ AGAIN" re-runs. Tap anywhere to reset.                ║
+  ║                                                              ║
+  ║  ARCHITECTURE                                                 ║
+  ║  State machine  →  screensaver | collecting | locked |       ║
+  ║                     selecting  | winner                      ║
+  ║  Touch tracking →  Map<touchId, {el, color, num}>            ║
+  ║  Animation      →  Single RAF loop + CSS animations          ║
+  ║  Audio          →  Web Audio API (synthesized, no files)     ║
+  ║                                                              ║
+  ║  License: MIT                                                ║
+  ╚══════════════════════════════════════════════════════════════╝
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+
+<!-- ── VIEWPORT & PWA ─────────────────────────────────────── -->
+<!-- viewport-fit=cover + safe-area-inset-* lets us paint into
+     notch / Dynamic Island / home-bar areas on modern phones. -->
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+
+<!-- ── WEB APP MANIFEST ───────────────────────────────────── -->
+<!-- Inlined as a data URI so the entire experience stays in one
+     file. Enables "Add to Home Screen" with app name, fullscreen
+     display mode, and a dark splash screen on Android / iOS.    -->
+<link rel="manifest" href="data:application/manifest+json,{
+  %22name%22:%22ALTAR%20%E2%80%94%20Who%20Goes%20First%22,
+  %22short_name%22:%22ALTAR%22,
+  %22description%22:%22Board-game%20first-player%20selector%22,
+  %22display%22:%22fullscreen%22,
+  %22orientation%22:%22any%22,
+  %22background_color%22:%22%23020810%22,
+  %22theme_color%22:%22%23000000%22,
+  %22start_url%22:%22.%22,
+  %22icons%22:[{%22src%22:%22data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20viewBox%3D'0%200%20512%20512'%3E%3Crect%20width%3D'512'%20height%3D'512'%20fill%3D'%23020810'%2F%3E%3Ctext%20x%3D'50%25'%20y%3D'54%25'%20font-size%3D'340'%20text-anchor%3D'middle'%20dominant-baseline%3D'middle'%20fill%3D'%2300ff41'%3E%E2%96%B2%3C%2Ftext%3E%3C%2Fsvg%3E%22,%22sizes%22:%22512x512%22,%22type%22:%22image/svg+xml%22}]
+}">
+<!-- Safari ignores the manifest icon — needs its own link tag -->
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' fill='%23020810'/><text x='50%25' y='54%25' font-size='340' text-anchor='middle' dominant-baseline='middle' fill='%2300ff41'>▲</text></svg>">
+
+<!-- ── OPEN GRAPH & TWITTER CARD ─────────────────────────── -->
+<!-- Replace XXXXXXXXXXXX with your live URL before publishing. -->
+<!-- Replace altar-preview.png with an actual screenshot.       -->
+<meta property="og:type"        content="website">
+<meta property="og:url"         content="https://i.imgur.com">
+<meta property="og:title"       content="ALTAR — Who Goes First?">
+<meta property="og:description" content="The board-game first-player ritual. Everyone places a finger. One is chosen. Single-file web app — no install needed.">
+<meta property="og:image"       content="https://i.imgur.com/tRcdq1Y.png">
+<meta name="twitter:card"       content="summary_large_image">
+<meta name="twitter:title"      content="ALTAR — Who Goes First?">
+<meta name="twitter:description"content="The board-game first-player ritual. Everyone places a finger. One is chosen.">
+<meta name="twitter:image"      content="https://i.imgur.com/tRcdq1Y.png">
+
+<title>ALTAR — Who Goes First?</title>
+
+<!-- ── FONTS ──────────────────────────────────────────────── -->
+<!-- Black Ops One  → display titles (ALTAR, CHOSEN, BOLD MOVE) -->
+<!-- Share Tech Mono → UI labels, status pills, player numbers  -->
+<!-- Cached by the browser after first load.                     -->
+<link href="https://fonts.googleapis.com/css2?family=Black+Ops+One&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+/*
+  CSS ARCHITECTURE
+  ─────────────────────────────────────────────────────────────
+  All layout is position:fixed / position:absolute stacked by
+  z-index. No flexbox grids, no scrolling — this is a full-screen
+  touch canvas. Z-index layers from bottom to top:
+
+    5    Ghost fingerprints (screensaver decoration)
+    10   Logo
+    11   Edge hints
+    20   Live fingerprints
+    30   Winner fingerprint (elevated above losers)
+    50   Touch layer (invisible, captures all touch events)
+    60   Timer SVG (perimeter countdown rect)
+    65   Lock flash (brief green pulse on lock-in)
+    70   Player count pill + status pill
+    75   Color flash (winner color burst)
+    80   Winner overlay text
+    200  Control buttons (sound + fullscreen)
+    250  Sound toast
+    300  iOS hint
+    9999 Scanline overlay (decorative, pointer-events:none)
+  ─────────────────────────────────────────────────────────────
+*/
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  /* Brand colors */
+  --accent:  #00ff41;          /* phosphor green — the entire palette is keyed to this */
+  --bg:      #020810;          /* near-black with a faint blue undertone */
+
+  /* Fonts */
+  --font-t:  'Black Ops One', serif;      /* display: titles, winner text */
+  --font-m:  'Share Tech Mono', monospace; /* UI: labels, pills, numbers */
+
+  /* Safe-area insets — populated by the browser on notched devices.
+     Used as calc() offsets throughout to keep UI clear of hardware edges. */
+  --st: env(safe-area-inset-top,    0px);
+  --sb: env(safe-area-inset-bottom, 0px);
+  --sl: env(safe-area-inset-left,   0px);
+  --sr: env(safe-area-inset-right,  0px);
+
+  /* Fingerprint dimensions (landscape defaults; overridden per orientation below).
+     fp-hw / fp-hh are the half-values used for centering calculations.
+     90px wide ensures the print visually bleeds past a ~55px finger pad on all sides. */
+  --fp-w:   90px;
+  --fp-h:  108px;
+  --fp-hw:  45px;
+  --fp-hh:  54px;
+
+  /* Sonar ring — expands outward from fingerprint center */
+  --ring-sz:  114px;
+  --ring-half: 57px;
+}
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--accent);
+  font-family: var(--font-m);
+  touch-action: none;           /* disable browser pan/zoom — we own all touch events */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent; /* kill the grey flash on tap (iOS/Android) */
+  overscroll-behavior: none;    /* prevent Android pull-to-refresh during game play */
+}
+
+/* Decorative CRT scanline overlay — sits above everything, passes all pointer events */
+body::after {
+  content: ''; position: fixed; inset: 0;
+  background: repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.06) 3px,rgba(0,0,0,.06) 4px);
+  pointer-events: none; z-index: 9999;
+}
+
+#app { position: fixed; inset: 0; width: 100%; height: 100%; overflow: hidden; }
+
+/* ── SONAR BG ─── */
+#bg-rings {
+  position: absolute; inset: 0; pointer-events: none;
+  background:
+    radial-gradient(circle at 50% 50%,
+      transparent 8%,  rgba(0,255,65,.022) 8.5%,  transparent 9%,
+      transparent 19%, rgba(0,255,65,.018) 19.5%, transparent 20%,
+      transparent 30%, rgba(0,255,65,.014) 30.5%, transparent 31%,
+      transparent 42%, rgba(0,255,65,.011) 42.5%, transparent 43%,
+      transparent 55%, rgba(0,255,65,.009) 55.5%, transparent 56%,
+      transparent 69%, rgba(0,255,65,.006) 69.5%, transparent 70%,
+      transparent 84%, rgba(0,255,65,.004) 84.5%, transparent 85%
+    ),
+    linear-gradient(90deg,transparent 49.6%,rgba(0,255,65,.015) 50%,transparent 50.4%),
+    linear-gradient(0deg, transparent 49.6%,rgba(0,255,65,.015) 50%,transparent 50.4%);
+}
+
+/* ── RADAR ─── */
+#radar-wrap {
+  position: absolute; top: 50%; left: 50%;
+  width: 200vmax; height: 200vmax;
+  margin: -100vmax 0 0 -100vmax;
+  border-radius: 50%; overflow: hidden;
+  pointer-events: none;
+  opacity: 1; transition: opacity 1.2s;
+}
+#radar-wrap.hidden { opacity: 0; }
+#radar-sweep {
+  position: absolute; inset: 0; border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,transparent 0deg,
+    rgba(0,255,65,.0) 0deg,
+    rgba(0,255,65,.11) 12deg,
+    rgba(0,255,65,.05) 20deg,
+    transparent 30deg
+  );
+  animation: sweep 4.5s linear infinite;
+}
+@keyframes sweep { to { transform: rotate(360deg); } }
+
+#radar-center {
+  position: absolute; top: 50%; left: 50%;
+  width: 10px; height: 10px; margin: -5px 0 0 -5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent), 0 0 18px var(--accent), 0 0 40px rgba(0,255,65,.3);
+  pointer-events: none;
+  animation: cpulse 2.2s ease-in-out infinite;
+}
+@keyframes cpulse {
+  0%,100% { transform: scale(1);   opacity: .75; }
+  50%      { transform: scale(1.5); opacity: 1; }
+}
+
+/* ── LOGO — top region ─── */
+#logo {
+  position: absolute;
+  top: calc(var(--st) + 9%);
+  left: 0; right: 0;
+  text-align: center;
+  pointer-events: none; z-index: 10;
+  transition: opacity .7s, transform .7s;
+}
+#logo.dim { opacity: .07; transform: translateY(-10px) scale(.88); }
+
+#logo-sym {
+  display: block;
+  font-size: clamp(1.3rem, 3.5vw, 2.2rem);
+  animation: logo-glow 2.6s ease-in-out infinite;
+  line-height: 1; margin-bottom: .1rem;
+}
+@keyframes logo-glow {
+  0%,100% { text-shadow: 0 0 8px rgba(0,255,65,.5), 0 0 22px rgba(0,255,65,.1); opacity: .6; }
+  50%      { text-shadow: 0 0 18px rgba(0,255,65,1), 0 0 55px rgba(0,255,65,.35), 0 0 90px rgba(0,255,65,.1); opacity: 1; }
+}
+#logo-title {
+  font-family: var(--font-t);
+  font-size: clamp(3rem, 11vw, 7rem);
+  letter-spacing: .25em; line-height: 1;
+  text-shadow: 0 0 25px rgba(0,255,65,.22);
+}
+
+/* ── EDGE HINTS ─── */
+.edge-hint {
+  position: absolute;
+  font-family: var(--font-m);
+  font-size: clamp(.4rem, 1vw, .58rem);
+  letter-spacing: .28em;
+  color: rgba(0,255,65,.26);
+  pointer-events: none; z-index: 11;
+  white-space: nowrap;
+  animation: hint-breathe 3.2s ease-in-out infinite;
+  transition: opacity .5s;
+}
+.edge-hint.hide { opacity: 0 !important; animation: none; }
+@keyframes hint-breathe {
+  0%,100% { opacity: .2; }
+  50%      { opacity: .42; }
+}
+#hint-b {
+  bottom: calc(var(--sb) + 16px);
+  left: 50%; transform: translateX(-50%);
+}
+#hint-t {
+  top: calc(var(--st) + 16px);
+  left: 50%; transform: translateX(-50%) rotate(180deg);
+}
+#hint-l {
+  left: calc(var(--sl) + 16px);
+  top: 50%; transform: translateY(-50%) rotate(90deg);
+}
+#hint-r {
+  right: calc(var(--sr) + 16px);
+  top: 50%; transform: translateY(-50%) rotate(-90deg);
+}
+
+/* ── PLAYER COUNT — top-left corner ─── */
+#player-count {
+  position: absolute;
+  top: calc(var(--st) + 12px);
+  left: calc(var(--sl) + 14px);
+  font-size: clamp(.44rem, 1.2vw, .58rem);
+  letter-spacing: .2em;
+  background: rgba(0,20,10,.78);
+  border: 1px solid rgba(0,255,65,.2);
+  border-radius: 20px;
+  padding: .28em .65em;
+  opacity: 0; transition: opacity .4s;
+  z-index: 70; pointer-events: none; color: var(--accent);
+}
+#player-count.show { opacity: 1; }
+/* .maxed: brief red flash when a 11th finger tries to join — makes the cap obvious */
+#player-count.maxed {
+  color: #ff4433;
+  border-color: rgba(255,68,51,.5);
+  background: rgba(40,0,0,.85);
+}
+
+/* ── STATUS PILL — safely above bottom edge ─── */
+#status {
+  position: absolute;
+  bottom: calc(var(--sb) + 55px);
+  left: 50%; transform: translateX(-50%);
+  font-size: clamp(.48rem, 1.5vw, .68rem);
+  letter-spacing: .26em;
+  background: rgba(0,20,10,.8);
+  border: 1px solid rgba(0,255,65,.18);
+  border-radius: 20px;
+  padding: .32em .85em;
+  color: var(--accent);
+  opacity: 0; transition: opacity .4s;
+  z-index: 70; pointer-events: none; white-space: nowrap;
+}
+#status.show { opacity: .92; }
+
+/* ── TOUCH LAYER ─── */
+#touch-layer { position: absolute; inset: 0; z-index: 50; }
+
+/* ── FINGERPRINT ELEMENTS ─── */
+.fp-ghost, .fp-live {
+  position: absolute;
+  width:  var(--fp-w);
+  height: var(--fp-h);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.fp-ghost svg, .fp-live svg { width: 100%; height: 100%; }
+
+.fp-ghost { opacity: 0; z-index: 5; }
+.fp-ghost svg { filter: drop-shadow(0 0 4px currentColor); }
+
+/* fp-live starts invisible, fades in on .active */
+.fp-live { opacity: 0; z-index: 20; transition: opacity .2s; }
+.fp-live.active { opacity: 1; }
+.fp-live.fading { opacity: 0 !important; transition: opacity .35s; }
+
+/* Continuous subtle brightness pulse while finger is down */
+.fp-live.active svg {
+  filter: drop-shadow(0 0 7px currentColor);
+  animation: fp-alive 2s ease-in-out infinite;
+}
+@keyframes fp-alive {
+  0%,100% { filter: drop-shadow(0 0 5px currentColor);  opacity: .82; }
+  50%      { filter: drop-shadow(0 0 14px currentColor); opacity: 1; }
+}
+
+/* Player label — above the FP, never under the finger */
+.fp-num {
+  position: absolute;
+  top: -24px; left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-m);
+  font-size: clamp(.48rem, 1.3vw, .62rem);
+  letter-spacing: .14em;
+  background: rgba(0,12,6,.85);
+  border: 1px solid currentColor;
+  border-radius: 10px;
+  padding: .1em .42em;
+  white-space: nowrap; color: currentColor; opacity: .92;
+}
+
+/* ── SONAR RING ─── */
+.fp-ring {
+  position: absolute;
+  top: 50%; left: 50%;
+  width:  var(--ring-sz);
+  height: var(--ring-sz);
+  margin: calc(-1 * var(--ring-half)) 0 0 calc(-1 * var(--ring-half));
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  pointer-events: none; opacity: 0;
+}
+/* Continuous ring on live fingers */
+.fp-live.active .fp-ring { animation: ring-live 1.35s ease-out infinite; }
+@keyframes ring-live {
+  0%   { transform: scale(.32); opacity: .8; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+/* One-shot ring for ghosts */
+.fp-ring.pop { animation: ring-pop .9s ease-out forwards; }
+@keyframes ring-pop {
+  0%   { transform: scale(.32); opacity: .78; }
+  100% { transform: scale(3.2); opacity: 0; }
+}
+
+/* ── SELECTION HI ─── */
+.fp-live.sel-hi svg {
+  animation: sel-burst .14s ease-out !important;
+  filter: drop-shadow(0 0 20px currentColor) brightness(2.4) !important;
+}
+@keyframes sel-burst {
+  0%  { transform: scale(1); }
+  50% { transform: scale(1.2); }
+  100%{ transform: scale(1); }
+}
+
+/* ── WINNER ─── */
+.fp-live.winner { z-index: 30; }
+.fp-live.winner svg {
+  animation: win-throb .55s ease-in-out infinite !important;
+  filter: drop-shadow(0 0 22px currentColor) brightness(2.1) !important;
+}
+@keyframes win-throb {
+  0%,100% { transform: scale(1.6); }
+  50%      { transform: scale(2.05); }
+}
+.fp-live.winner .fp-ring { animation: ring-win .6s ease-out infinite !important; }
+@keyframes ring-win {
+  0%   { transform: scale(.38); opacity: .9; }
+  100% { transform: scale(2.8); opacity: 0; }
+}
+.fp-live.winner::after {
+  content: '★'; position: absolute;
+  top: -34px; left: 50%; transform: translateX(-50%);
+  font-size: clamp(14px,3vw,20px);
+  color: currentColor; text-shadow: 0 0 12px currentColor;
+  animation: star-bob .55s ease-in-out infinite;
+}
+@keyframes star-bob {
+  0%,100% { transform: translateX(-50%) translateY(0); }
+  50%      { transform: translateX(-50%) translateY(-5px); }
+}
+
+/* ── LOSER ─── */
+.fp-live.loser {
+  opacity: .08 !important;
+  transform: translate(-50%,-50%) scale(.22) !important;
+  transition: opacity .65s, transform .65s !important;
+}
+.fp-live.loser svg  { animation: none !important; filter: none !important; }
+.fp-live.loser .fp-ring { animation: none !important; }
+
+/* ── TIMER — perimeter rect ─── */
+#timer-svg {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  pointer-events: none; z-index: 60;
+  opacity: 0; transition: opacity .4s;
+}
+#timer-svg.visible { opacity: 1; }
+#timer-rect {
+  fill: none; stroke: var(--accent);
+  stroke-width: 5; stroke-linecap: square;
+  filter: drop-shadow(0 0 5px var(--accent));
+  stroke-dasharray: 9999; stroke-dashoffset: 0;
+}
+#timer-rect.warn { stroke: #ffb700; filter: drop-shadow(0 0 5px #ffb700); }
+#timer-rect.crit {
+  stroke: #ff3300; filter: drop-shadow(0 0 8px #ff3300);
+  animation: crit-flash .38s ease-in-out infinite;
+}
+@keyframes crit-flash { 0%,100%{opacity:1} 50%{opacity:.45} }
+
+/* ── LOCK FLASH ─── */
+#lock-flash {
+  position: absolute; inset: 0;
+  background: rgba(0,255,65,.07);
+  pointer-events: none; z-index: 65;
+  opacity: 0; transition: opacity .12s;
+}
+#lock-flash.on { opacity: 1; }
+
+/* ── COLOR FLASH ─── */
+#color-flash {
+  position: absolute; inset: 0;
+  pointer-events: none; z-index: 75; opacity: 0;
+}
+
+/* ── WINNER OVERLAY — default: top half of screen ─── */
+/* JS will add .flip if the winner's finger is in the top half,
+   pushing text to the bottom half to avoid collision.           */
+#winner-overlay {
+  position: absolute;
+  top: 0; left: 0; right: 0; height: 50%;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  pointer-events: none; z-index: 80;
+  opacity: 0; transition: opacity .55s;
+  padding-top: calc(var(--st) + 8px);
+}
+#winner-overlay.show  { opacity: 1; pointer-events: auto; }
+/* .flip: overlay moves to bottom half; safe-area padding flips to bottom */
+#winner-overlay.flip  {
+  top: auto; bottom: 0;
+  padding-top: 0;
+  padding-bottom: calc(var(--sb) + 8px);
+}
+
+#w-player {
+  font-family: var(--font-m);
+  font-size: clamp(.52rem, 1.7vw, .78rem);
+  letter-spacing: .5em; opacity: .5; margin-bottom: .25rem;
+}
+#w-title {
+  font-family: var(--font-t);
+  font-size: clamp(2.8rem, 12vw, 7.5rem);
+  letter-spacing: .15em; line-height: 1;
+  text-shadow: 0 0 35px currentColor;
+  animation: w-glow 1s ease-in-out infinite;
+}
+@keyframes w-glow {
+  0%,100% { filter: brightness(1); }
+  50%      { filter: brightness(1.6); text-shadow: 0 0 60px currentColor, 0 0 100px currentColor; }
+}
+#w-first {
+  font-family: var(--font-m);
+  font-size: clamp(.6rem, 2vw, .9rem);
+  letter-spacing: .4em; opacity: .55; margin-top: .4rem;
+}
+#w-reset {
+  font-size: clamp(.38rem, 1vw, .52rem);
+  letter-spacing: .22em; opacity: .2; margin-top: 1.2rem;
+}
+
+/* ── PLAY AGAIN BUTTON — winner screen ─── */
+/* Visible, tappable, styled to match the ALTAR language.
+   Clears the auto-reset timeout so it doesn't race.     */
+#w-again {
+  margin-top: .9rem;
+  padding: .38em 1.1em;
+  font-family: var(--font-m);
+  font-size: clamp(.42rem, 1.2vw, .58rem);
+  letter-spacing: .28em;
+  color: var(--accent);
+  background: rgba(0,255,65,.07);
+  border: 1px solid rgba(0,255,65,.35);
+  border-radius: 20px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background .2s, opacity .2s;
+  opacity: .7;
+}
+#w-again:hover, #w-again:active { background: rgba(0,255,65,.18); opacity: 1; }
+
+/* ── SOUND TOGGLE BTN ─── */
+/* Sits left of the fullscreen btn; shares identical visual language */
+#snd-btn {
+  position: absolute;
+  top: calc(var(--st) + 10px);
+  right: calc(var(--sr) + 66px); /* 46px btn + 8px gap + 12px margin = left of fs-btn */
+  z-index: 200;
+  background: rgba(0,255,65,.06);
+  border: 1px solid rgba(0,255,65,.2);
+  border-radius: 7px;
+  width: 46px; height: 46px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+  transition: background .2s;
+}
+#snd-btn:active { background: rgba(0,255,65,.18); }
+#snd-btn svg {
+  width: 22px; height: 22px;
+  stroke: rgba(0,255,65,.6); fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+/* Muted state dims the icon slightly to signal "off" */
+#snd-btn.muted svg { stroke: rgba(0,255,65,.28); }
+
+/* ── FULLSCREEN BTN ─── */
+#fs-btn {
+  position: absolute;
+  top: calc(var(--st) + 10px);
+  right: calc(var(--sr) + 12px);
+  z-index: 200;
+  background: rgba(0,255,65,.06);
+  border: 1px solid rgba(0,255,65,.2);
+  border-radius: 7px;
+  width: 46px; height: 46px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+  transition: background .2s;
+}
+#fs-btn:active { background: rgba(0,255,65,.18); }
+#fs-btn svg {
+  width: 22px; height: 22px;
+  stroke: rgba(0,255,65,.6); fill: none;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+
+/* ── IOS HINT ─── */
+#ios-hint {
+  position: absolute;
+  bottom: calc(var(--sb) + 60px);
+  left: 50%; transform: translateX(-50%);
+  background: rgba(0,20,10,.94);
+  border: 1px solid rgba(0,255,65,.28);
+  border-radius: 8px;
+  padding: .65rem 1rem;
+  font-size: clamp(.5rem, 1.3vw, .6rem);
+  letter-spacing: .1em;
+  color: rgba(0,255,65,.8);
+  z-index: 300; white-space: nowrap;
+  opacity: 0; transition: opacity .3s;
+  pointer-events: none; text-align: center; line-height: 1.55;
+}
+#ios-hint.show { opacity: 1; }
+
+/* ── SOUND TOAST ─── */
+/* One-shot "🔊 Sound on" confirmation that appears on the very first touch.
+   Many players won't notice the mute button — this surfaces it passively.
+   Fades in fast, holds 1.4s, fades out. Never shown again that session.  */
+#snd-toast {
+  position: absolute;
+  top: calc(var(--st) + 68px); /* just below the two corner buttons */
+  right: calc(var(--sr) + 12px);
+  background: rgba(0,20,10,.88);
+  border: 1px solid rgba(0,255,65,.3);
+  border-radius: 8px;
+  padding: .38em .8em;
+  font-size: clamp(.42rem, 1.1vw, .55rem);
+  letter-spacing: .18em;
+  color: rgba(0,255,65,.85);
+  z-index: 250; white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .25s;
+}
+#snd-toast.show  { opacity: 1; }
+#snd-toast.hide  { opacity: 0; transition: opacity .6s; }
+
+/* ── PORTRAIT ─── */
+@media (orientation: portrait) {
+  :root {
+    --fp-w:   84px;  --fp-h:  100px;
+    --fp-hw:  42px;  --fp-hh:  50px;
+    --ring-sz: 104px; --ring-half: 52px;
+  }
+  #logo { top: calc(var(--st) + 7%); }
+  #logo-title { font-size: clamp(2.8rem, 14vw, 5.5rem); }
+  #hint-l, #hint-r { display: none; }
+}
+
+/* ── LANDSCAPE ─── */
+@media (orientation: landscape) {
+  :root {
+    --fp-w:   96px;  --fp-h:  115px;
+    --fp-hw:  48px;  --fp-hh:  57px;
+    --ring-sz: 118px; --ring-half: 59px;
+  }
+  #logo { top: calc(var(--st) + 5%); }
+  #logo-title { font-size: clamp(2.2rem, 8vw, 6rem); }
+  /* In landscape winner overlay gets a bit more height */
+  #winner-overlay { height: 52%; }
+}
+
+/* ── SMALL PHONE ─── */
+@media (max-width: 380px) {
+  :root {
+    --fp-w:   76px;  --fp-h:   91px;
+    --fp-hw:  38px;  --fp-hh:  45px;
+    --ring-sz: 94px; --ring-half: 47px;
+  }
+  #logo-title { font-size: 2.5rem; }
+  .fp-num { font-size: .45rem; top: -20px; }
+}
+
+/* ── REDUCED MOTION ─── */
+/* Respects OS "Reduce Motion" accessibility setting.
+   Kills decorative animations; keeps functional ones (timer, winner pulse).
+   Ghost screensaver is disabled via JS (see reducedMotion flag).           */
+@media (prefers-reduced-motion: reduce) {
+  #radar-sweep          { animation: none; }
+  #radar-center         { animation: none; opacity: .75; }
+  #logo-sym             { animation: none; opacity: .7; }
+  .edge-hint            { animation: none; opacity: .3; }
+  .fp-live.active svg   { animation: none; }
+  .fp-live.active .fp-ring { animation: none; opacity: 0; }
+  #w-title              { animation: none; }
+  @keyframes win-throb  { 0%,100% { transform: scale(1.6); } }
+}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── BACKGROUND LAYERS ──────────────────────────────────
+       bg-rings:    static radial + crosshair gradient giving the
+                    sonar-screen ring pattern (pure CSS, no canvas).
+       radar-wrap:  oversized circle (200vmax) containing the
+                    rotating conic-gradient sweep arm.
+       radar-center: pulsing center dot of the radar.
+       All three hidden/faded when the first finger touches down. -->
+  <div id="bg-rings"></div>
+  <div id="radar-wrap"><div id="radar-sweep"></div></div>
+  <div id="radar-center"></div>
+
+  <!-- ── LOGO ───────────────────────────────────────────────
+       Sits in the top ~9% of screen — clear of the center
+       touch zone. Dims (.dim) once collecting starts. -->
+  <div id="logo">
+    <span id="logo-sym">▲</span>
+    <div id="logo-title">ALTAR</div>
+  </div>
+
+  <!-- ── EDGE HINTS ─────────────────────────────────────────
+       Four copies of the same instruction, one per screen edge,
+       rotated to face players sitting on any side of the table.
+       Left/right hidden in portrait (not enough horizontal space).
+       All hidden the moment the first touch lands. -->
+  <div class="edge-hint" id="hint-b">▲ PLACE FINGERS ON SCREEN ▲</div>
+  <div class="edge-hint" id="hint-t">▲ PLACE FINGERS ON SCREEN ▲</div>
+  <div class="edge-hint" id="hint-l">▲ PLACE FINGERS ON SCREEN ▲</div>
+  <div class="edge-hint" id="hint-r">▲ PLACE FINGERS ON SCREEN ▲</div>
+
+  <!-- ── STATUS PILLS ───────────────────────────────────────
+       player-count: top-left corner — "N PLAYERS IN" during
+                     collecting. Turns red for "MAX 10" when cap hit.
+       status:       bottom-center — state messages like
+                     "HOLD — MORE PLAYERS CAN JOIN" or "LOCKED". -->
+  <div id="player-count"></div>
+  <div id="status"></div>
+
+  <!-- ── TOUCH LAYER ────────────────────────────────────────
+       Invisible full-screen div that captures all touch/mouse
+       events. Fingerprint elements are appended to this div
+       so they are sibling to the hitbox that spawned them.    -->
+  <div id="touch-layer"></div>
+
+  <!-- ── PERIMETER TIMER ────────────────────────────────────
+       SVG sized to 100vw × 100vh. A single <rect> with
+       stroke-dashoffset drives the countdown drain animation.
+       Color shifts: green → amber (50%) → red flashing (25%). -->
+  <svg id="timer-svg" xmlns="http://www.w3.org/2000/svg">
+    <rect id="timer-rect" x="5" y="5" rx="0" ry="0"/>
+  </svg>
+
+  <!-- ── FLASH LAYERS ───────────────────────────────────────
+       lock-flash:  brief full-screen green pulse when timer hits 0.
+       color-flash: brief full-screen pulse in the winner's color. -->
+  <div id="lock-flash"></div>
+  <div id="color-flash"></div>
+
+  <!-- ── WINNER OVERLAY ─────────────────────────────────────
+       Lives in the top 50% by default. JS adds .flip to move it
+       to the bottom half if the winner's finger is in the top half
+       (avoids text/fingerprint collision).
+       Auto-resets after WINNER_MS ms; "▲ AGAIN" cancels that. -->
+  <div id="winner-overlay">
+    <div id="w-player"></div>         <!-- "— PLAYER N —" -->
+    <div id="w-title"></div>          <!-- "CHOSEN" or "BOLD MOVE" (solo) -->
+    <div id="w-first">GOES FIRST</div>
+    <div id="w-reset">TAP ANYWHERE TO RESET</div>
+    <button id="w-again" aria-label="Run selection again">▲ AGAIN</button>
+  </div>
+
+  <!-- ── CONTROL BUTTONS (top-right corner) ─────────────────
+       Both share identical visual language (46×46px, same border/bg).
+       snd-btn:  left of fs-btn. Toggles Web Audio synthesis.
+                 .muted dims the icon; swaps snd-on / snd-off SVGs.
+       fs-btn:   rightmost. Fullscreen API on Android/Chrome.
+                 Shows ios-hint instead on iOS (no Fullscreen API). -->
+  <button id="snd-btn" aria-label="Toggle sound">
+    <svg id="snd-on" viewBox="0 0 24 24">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+      <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+      <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+    </svg>
+    <svg id="snd-off" viewBox="0 0 24 24" style="display:none">
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+      <line x1="23" y1="9" x2="17" y2="15"/>
+      <line x1="17" y1="9" x2="23" y2="15"/>
+    </svg>
+  </button>
+
+  <button id="fs-btn" aria-label="Toggle fullscreen">
+    <svg id="fs-expand" viewBox="0 0 24 24">
+      <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
+      <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
+    </svg>
+    <svg id="fs-compress" viewBox="0 0 24 24" style="display:none">
+      <polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/>
+      <line x1="10" y1="14" x2="3"  y2="21"/><line x1="21" y1="3" x2="14" y2="10"/>
+    </svg>
+  </button>
+
+  <!-- ── TRANSIENT NOTIFICATIONS ────────────────────────────
+       ios-hint:  "Add to Home Screen" instruction — shown when
+                  fullscreen button tapped on iOS.
+       snd-toast: "🔊 SOUND ON" — fires once on first touch to
+                  surface the mute button to players who missed it. -->
+  <div id="ios-hint">Tap <strong>Share ↑</strong> → <strong>Add to Home Screen</strong> for true fullscreen</div>
+  <div id="snd-toast">🔊 SOUND ON</div>
+
+</div>
+<script>
+"use strict";
+
+/* ════════════════════════════════════════════════════════════
+   CONSTANTS
+   Tune gameplay feel here without touching logic.
+   ════════════════════════════════════════════════════════════ */
+
+const TIMER_MS   = 4000;  // ms from first touch (or last change) before lock-in
+const WINNER_MS  = 5500;  // ms winner screen stays up before auto-reset
+const LOCK_PAUSE = 500;   // ms of lock-flash before selection animation begins
+const MIN_STEPS  = 24;    // minimum slot-machine steps before the final lap
+
+// 10 colors = max simultaneous touch points on iPad / Android tablet.
+// Each entry is visually distinct on a dark background at a glance.
+// Order matters: spread across the hue wheel to avoid adjacent-player confusion.
+const PLAYER_COLORS = [
+  '#00ff41',  // P1  phosphor green  (brand color)
+  '#00d4ff',  // P2  sky blue
+  '#ff4433',  // P3  red
+  '#ffb700',  // P4  amber
+  '#cc00ff',  // P5  violet
+  '#ff6b9d',  // P6  pink
+  '#aaff00',  // P7  lime
+  '#ff6600',  // P8  orange
+  '#00ffcc',  // P9  teal / aqua
+  '#ff00cc',  // P10 magenta
+];
+
+/* ════════════════════════════════════════════════════════════
+   DOM REFERENCES
+   Cached once at startup — never queried again during gameplay.
+   ════════════════════════════════════════════════════════════ */
+
+const $app        = document.getElementById('app');
+const $layer      = document.getElementById('touch-layer');
+const $logo       = document.getElementById('logo');
+const $timerSVG   = document.getElementById('timer-svg');
+const $timerRect  = document.getElementById('timer-rect');
+const $status     = document.getElementById('status');
+const $pcount     = document.getElementById('player-count');
+const $lockFlash  = document.getElementById('lock-flash');
+const $cFlash     = document.getElementById('color-flash');
+const $winOv      = document.getElementById('winner-overlay');
+const $wPlayer    = document.getElementById('w-player');
+const $wTitle     = document.getElementById('w-title');
+const $wFirst     = document.getElementById('w-first');
+const $wAgain     = document.getElementById('w-again');   // play-again button
+const $radarWrap  = document.getElementById('radar-wrap');
+const $fsBtn      = document.getElementById('fs-btn');
+const $fsExpand   = document.getElementById('fs-expand');
+const $fsCompress = document.getElementById('fs-compress');
+const $iosHint    = document.getElementById('ios-hint');
+const $sndBtn     = document.getElementById('snd-btn');   // sound toggle button
+const $sndOn      = document.getElementById('snd-on');    // speaker-on icon
+const $sndOff     = document.getElementById('snd-off');   // speaker-off icon
+const $sndToast   = document.getElementById('snd-toast'); // first-touch sound hint
+const edgeHints   = document.querySelectorAll('.edge-hint');
+
+/* ════════════════════════════════════════════════════════════
+   MUTABLE STATE
+   ════════════════════════════════════════════════════════════ */
+
+// STATE: current phase of the state machine.
+// Valid values: 'screensaver' | 'collecting' | 'locked' | 'selecting' | 'winner'
+let STATE     = 'screensaver';
+
+// fingers: live touch points. Key = touch identifier (int) or 'mouse'.
+// Value = { el: HTMLElement, color: string, num: int }
+let fingers   = new Map();
+
+let playerSeq = 0;       // monotonic counter — increments with each new finger, never resets mid-game
+let timerOn   = false;   // whether tickTimer() should decrement timerLeft
+let timerLeft = TIMER_MS;
+let timerLast = 0;       // performance.now() timestamp of last timer tick
+let perimLen  = 0;       // perimeter length of the timer rect in px (recalculated on resize)
+let ghosts    = [];      // active Ghost instances during screensaver
+let winTout   = null;    // setTimeout handle for the auto-reset after winner reveal
+let mDown     = false;   // mouse button held (desktop testing only)
+let soundEnabled  = true;  // toggled by #snd-btn; gates all Web Audio output
+
+// reducedMotion: read once from the OS accessibility preference.
+// When true: JS suppresses ghost spawning. CSS media query kills CSS animations.
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// soundToastShown: one-shot flag — the "🔊 SOUND ON" toast fires exactly once per page load.
+let soundToastShown = false;
+
+/* ════════════════════════════════════════════════════════════
+   AUDIO  (Web Audio API — zero external files)
+   All sounds are synthesized from OscillatorNode + GainNode.
+   getAudioCtx() is called lazily on the first user gesture;
+   browsers block AudioContext creation until a touch/click fires.
+   ════════════════════════════════════════════════════════════ */
+
+let actx = null;
+
+// getAudioCtx: lazily creates (and caches) the AudioContext.
+// Called from every touch/mouse handler so the context is ready
+// the moment the first sound needs to play.
+function getAudioCtx() {
+  if (!actx) try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+  return actx;
+}
+
+// note: the single primitive for all sound synthesis.
+// freq   — starting frequency in Hz
+// vol    — peak gain (0–1)
+// dur    — duration in seconds
+// type   — oscillator waveform ('sine' | 'square' | 'sawtooth' | 'triangle')
+// delay  — seconds before the note starts (used to stagger chords)
+//
+// The frequency ramps DOWN to 36% of its starting value over the note duration,
+// giving every sound a natural descending-sonar quality.
+function note(freq, vol, dur, type = 'sine', delay = 0) {
+  if (!soundEnabled) return;
+  const c = getAudioCtx(); if (!c) return;
+  try {
+    const o = c.createOscillator(), g = c.createGain();
+    o.connect(g); g.connect(c.destination);
+    o.type = type; o.frequency.value = freq;
+    o.frequency.exponentialRampToValueAtTime(freq * .36, c.currentTime + delay + dur);
+    g.gain.setValueAtTime(0, c.currentTime + delay);
+    g.gain.linearRampToValueAtTime(vol, c.currentTime + delay + .022);
+    g.gain.exponentialRampToValueAtTime(.0001, c.currentTime + delay + dur);
+    o.start(c.currentTime + delay); o.stop(c.currentTime + delay + dur + .06);
+  } catch(e) {}
+}
+
+// Ping helpers — each maps to a specific game moment:
+function pingTouch(n)             { const f=[660,780,520,880,600,720,560,820]; note(f[(n-1)%f.length],.09,.55); } // unique pitch per player 1–8
+function pingRelease()            { note(400,.05,.3); }                                                           // finger lift
+function pingGhost()              { note(360+Math.random()*280,.026,.9); }                                        // ghost screensaver appears
+function pingTick(step,total)     { note(170 + (step/total)*330,.036,.1,'square'); }                              // selection cycle tick (pitch rises toward winner)
+function pingLock()               { note(72,.2,.45); note(144,.07,.3,'sine',.06); }                               // low mechanical lock-in thud
+function pingWinner()             { [220,277,330,440,554].forEach((f,i)=>note(f,.1,.85,'sine',i*.055)); }         // ascending major arpeggio
+
+/* ════════════════════════════════════════════════════════════
+   TIMER SVG
+   A single SVG <rect> spanning 100vw × 100vh. stroke-dashoffset
+   drives the drain: offset = perimLen × (1 − progress).
+   resizeTimer() recalculates perimLen on every resize/rotation
+   so the rect always matches the actual viewport.
+   ════════════════════════════════════════════════════════════ */
+function resizeTimer() {
+  const W = window.innerWidth, H = window.innerHeight;
+  $timerSVG.setAttribute('viewBox',`0 0 ${W} ${H}`);
+  $timerRect.setAttribute('width', W-10);
+  $timerRect.setAttribute('height',H-10);
+  perimLen = 2*((W-10)+(H-10));
+  $timerRect.setAttribute('stroke-dasharray', perimLen);
+  $timerRect.setAttribute('stroke-dashoffset', 0);
+}
+resizeTimer();
+window.addEventListener('resize', resizeTimer);
+// 220 ms debounce on orientationchange — the viewport dimensions
+// are unreliable for ~100–200 ms after the rotation event fires.
+window.addEventListener('orientationchange', ()=>setTimeout(resizeTimer,220));
+
+// setTimer: p is 0–1 (1 = full, 0 = empty). Updates dashoffset + color state.
+function setTimer(p) {
+  $timerRect.setAttribute('stroke-dashoffset', perimLen*(1-p));
+  $timerRect.classList.toggle('warn', p<.5 && p>=.25);  // amber at 50%
+  $timerRect.classList.toggle('crit', p<.25);            // red flashing at 25%
+}
+
+/* ════════════════════════════════════════════════════════════
+   GHOST FINGERPRINTS  (screensaver decoration)
+   Each Ghost is a lifecycle state machine:
+     in → hold → out → dead
+   Ghosts drift slowly (random velocity vector, bounce off edges),
+   fade in with a sonar ping, breathe during hold, then fade out.
+   The RAF loop keeps 3+ alive at all times.
+   Entirely suppressed when reducedMotion is true.
+   ════════════════════════════════════════════════════════════ */
+
+// fpSVG: returns the fingerprint SVG markup (6 concentric ellipses).
+// Used for both ghost and live fingerprints — same shape, different CSS classes.
+function fpSVG() {
+  return `<svg viewBox="0 0 60 72" fill="none">
+    <ellipse cx="30" cy="40" rx="4"  ry="5"  stroke="currentColor" stroke-width="2.5"/>
+    <ellipse cx="30" cy="39" rx="9"  ry="11" stroke="currentColor" stroke-width="2"/>
+    <ellipse cx="30" cy="38" rx="15" ry="18" stroke="currentColor" stroke-width="1.5"/>
+    <ellipse cx="30" cy="37" rx="21" ry="25" stroke="currentColor" stroke-width="1.1"/>
+    <ellipse cx="30" cy="36" rx="27" ry="32" stroke="currentColor" stroke-width=".8"/>
+    <ellipse cx="30" cy="35" rx="29" ry="35" stroke="currentColor" stroke-width=".5" opacity=".5"/>
+  </svg>`;
+}
+
+class Ghost {
+  constructor() {
+    const W=window.innerWidth, H=window.innerHeight;
+    this.x   = 40+Math.random()*(W-80);
+    this.y   = 40+Math.random()*(H-80);
+    this.vx  = (Math.random()-.5)*.19;
+    this.vy  = (Math.random()-.5)*.19;
+    this.op  = 0; this.phase='in'; this.pt=0;
+    this.tIn = 650+Math.random()*500;
+    this.tHold=2400+Math.random()*3200;
+    this.tOut=580+Math.random()*400;
+    this.born=performance.now()+Math.random()*3200;
+    this.pinged=false;
+    this.color=PLAYER_COLORS[Math.floor(Math.random()*PLAYER_COLORS.length)];
+    this.el=document.createElement('div');
+    this.el.className='fp-ghost';
+    this.el.style.color=this.color;
+    this.el.innerHTML=fpSVG();
+    $layer.appendChild(this.el);
+  }
+  tick(now,dt) {
+    if (now<this.born) return;
+    const W=window.innerWidth, H=window.innerHeight;
+    this.x+=this.vx*dt; this.y+=this.vy*dt;
+    if(this.x<35){this.x=35;this.vx*=-1;}
+    if(this.x>W-35){this.x=W-35;this.vx*=-1;}
+    if(this.y<35){this.y=35;this.vy*=-1;}
+    if(this.y>H-35){this.y=H-35;this.vy*=-1;}
+    this.pt+=dt;
+    if(this.phase==='in'){
+      this.op=Math.min(1,this.pt/this.tIn);
+      if(!this.pinged&&this.op>.12){
+        this.pinged=true; pingGhost();
+        const r=document.createElement('div');
+        r.className='fp-ring pop'; r.style.color=this.color;
+        this.el.appendChild(r); setTimeout(()=>r.remove(),950);
+      }
+      if(this.pt>=this.tIn){this.phase='hold';this.pt=0;}
+    } else if(this.phase==='hold'){
+      this.op=.46+.11*Math.sin(now*.0018+this.x*.04);
+      if(this.pt>=this.tHold){this.phase='out';this.pt=0;}
+    } else if(this.phase==='out'){
+      this.op=Math.max(0,.5*(1-this.pt/this.tOut));
+      if(this.pt>=this.tOut) this.phase='dead';
+    }
+    this.el.style.opacity=this.op;
+    this.el.style.left=this.x+'px';
+    this.el.style.top=this.y+'px';
+  }
+  dead()   { return this.phase==='dead'; }
+  remove() { this.el.remove(); }
+}
+
+function spawnGhosts(n){
+  // Ghosts are decorative — skip entirely for users who want reduced motion
+  if (reducedMotion) return;
+  for(let i=0;i<n;i++) ghosts.push(new Ghost());
+}
+function clearGhosts() { ghosts.forEach(g=>g.remove()); ghosts=[]; }
+function tickGhosts(now,dt){
+  ghosts=ghosts.filter(g=>{ g.tick(now,dt); if(g.dead()){g.remove();return false;} return true; });
+  if(ghosts.length<3) spawnGhosts(1);
+}
+
+/* ── FINGER MANAGEMENT ─── */
+function addFinger(id,x,y){
+  if(fingers.has(id)) return;
+
+  // Hard cap: 10 matches the maximum simultaneous touch points on iPad/Android tablet.
+  // Flash the player-count pill red for 800 ms so the table knows why the touch was ignored.
+  if(fingers.size >= 10){
+    $pcount.textContent = 'MAX 10';
+    $pcount.classList.add('show','maxed');
+    clearTimeout($pcount._maxTout);
+    $pcount._maxTout = setTimeout(()=>{
+      $pcount.classList.remove('maxed');
+      updateCount(); // restore normal count display
+    }, 800);
+    return;
+  }
+
+  playerSeq++;
+  const num=playerSeq;
+  const color=PLAYER_COLORS[(num-1)%PLAYER_COLORS.length];
+  const el=document.createElement('div');
+  el.className='fp-live';
+  el.style.color=color; el.style.left=x+'px'; el.style.top=y+'px';
+  const ring=document.createElement('div');
+  ring.className='fp-ring'; ring.style.color=color;
+  const lbl=document.createElement('div');
+  lbl.className='fp-num'; lbl.textContent='P'+num;
+  el.innerHTML=fpSVG();
+  el.appendChild(ring); el.appendChild(lbl);
+  $layer.appendChild(el);
+  requestAnimationFrame(()=>el.classList.add('active'));
+  fingers.set(id,{el,color,num});
+  pingTouch(num);
+
+  // First-touch toast: surface the sound toggle to players who missed the button.
+  // Shows once per session, only when sound is currently on.
+  if (num === 1 && !soundToastShown && soundEnabled) {
+    soundToastShown = true;
+    $sndToast.classList.add('show');
+    setTimeout(() => { $sndToast.classList.replace('show','hide');
+      setTimeout(() => $sndToast.classList.remove('hide'), 650); }, 1800);
+  }
+}
+function moveFinger(id,x,y){ const f=fingers.get(id); if(f){f.el.style.left=x+'px';f.el.style.top=y+'px';} }
+function removeFinger(id){
+  const f=fingers.get(id); if(!f) return;
+  f.el.classList.add('fading'); setTimeout(()=>f.el.remove(),380);
+  fingers.delete(id); pingRelease();
+}
+function clearFingers(){ fingers.forEach(f=>f.el.remove()); fingers.clear(); playerSeq=0; }
+
+function updateCount(){
+  const n=fingers.size;
+  if(n>0&&STATE==='collecting'){
+    $pcount.textContent=n+(n===1?' PLAYER':' PLAYERS')+' IN';
+    $pcount.classList.add('show');
+  } else { $pcount.classList.remove('show'); }
+}
+
+/* ── TIMER ─── */
+function startTimer(){ timerLeft=TIMER_MS; timerOn=true; timerLast=performance.now(); $timerSVG.classList.add('visible'); setTimer(1); }
+function resetTimer(){ timerLeft=TIMER_MS; timerLast=performance.now(); setTimer(1); $timerRect.classList.remove('warn','crit'); }
+function stopTimer() { timerOn=false; $timerSVG.classList.remove('visible'); setTimer(1); $timerRect.classList.remove('warn','crit'); }
+function tickTimer(now){
+  if(!timerOn) return;
+  const dt=now-timerLast; timerLast=now;
+  timerLeft=Math.max(0,timerLeft-dt);
+  setTimer(timerLeft/TIMER_MS);
+  if(timerLeft<=0){ timerOn=false; lockIn(); }
+}
+
+/* ── HELPERS ─── */
+function setStatus(msg){ $status.textContent=msg; $status.classList.toggle('show',msg!==''); }
+function hideHints(){ edgeHints.forEach(h=>h.classList.add('hide')); }
+function showHints(){ edgeHints.forEach(h=>h.classList.remove('hide')); }
+
+/* ── STATE MACHINE ─── */
+function enterScreensaver(){
+  STATE='screensaver'; clearFingers(); stopTimer();
+  setStatus(''); showHints();
+  $logo.classList.remove('dim');
+  $radarWrap.classList.remove('hidden');
+  $winOv.classList.remove('show');
+  $pcount.classList.remove('show');
+  $cFlash.style.opacity='0';
+  spawnGhosts(4+Math.floor(Math.random()*3));
+}
+
+function enterCollecting(){
+  STATE='collecting'; clearGhosts(); hideHints();
+  $logo.classList.add('dim');
+  $radarWrap.classList.add('hidden');
+  setStatus('HOLD — MORE PLAYERS CAN JOIN');
+  startTimer();
+}
+
+function lockIn(){
+  if(STATE!=='collecting') return;
+  if(fingers.size===0){ enterScreensaver(); return; }
+  STATE='locked'; stopTimer();
+  setStatus('LOCKED · CHOOSING...');
+  $pcount.classList.remove('show');
+  pingLock();
+  $lockFlash.classList.add('on');
+  setTimeout(()=>{ $lockFlash.classList.remove('on'); runSelection(); }, LOCK_PAUSE);
+}
+
+function enterWinner(wid){
+  STATE='winner';
+  const wf=fingers.get(wid);
+  if(!wf){ enterScreensaver(); return; }
+  fingers.forEach((f,id)=>{
+    f.el.classList.remove('sel-hi');
+    f.el.classList.add(id===wid?'winner':'loser');
+  });
+  $cFlash.style.background=wf.color;
+  $cFlash.style.transition='opacity .08s';
+  $cFlash.style.opacity='.18';
+  setTimeout(()=>{ $cFlash.style.opacity='0'; },320);
+  $wPlayer.textContent='— PLAYER '+wf.num+' —';
+  $wPlayer.style.color=wf.color;
+  $wTitle.textContent=fingers.size===1?'BOLD MOVE':'CHOSEN';
+  $wTitle.style.color=wf.color;
+  $wFirst.style.color=wf.color;
+  $wAgain.style.color=wf.color;
+  $wAgain.style.borderColor=wf.color;
+
+  // Collision fix: if winner's finger is in the top half of the screen,
+  // flip the overlay to the bottom half so text and finger don't fight.
+  const winnerY = parseFloat(wf.el.style.top) || 0;
+  const inTopHalf = winnerY < window.innerHeight / 2;
+  $winOv.classList.toggle('flip', inTopHalf);
+
+  $winOv.classList.add('show');
+  setStatus(''); $pcount.classList.remove('show');
+  pingWinner();
+  clearTimeout(winTout);
+  winTout=setTimeout(enterScreensaver, WINNER_MS);
+}
+
+/* ════════════════════════════════════════════════════════════
+   SELECTION ALGORITHM  (the slot machine)
+
+   The winner is chosen by Math.random() BEFORE the animation
+   starts — the visual drama is pure theater, not real-time RNG.
+
+   Animation sequence:
+   1. [rand] random steps: highlight finger indices in random order,
+      fast at first. Creates the "spinning" illusion.
+   2. [final lap]: cycle through ALL fingers in order, ending on
+      the winner. This guarantees the animation lands on the winner
+      without looking predetermined until the very last step.
+
+   Timing: each step delay = 38 + (progress^2.5 × 780) ms.
+   The 2.5 exponent gives a steep exponential slow-down — fast
+   enough to feel chaotic early, dramatic enough to feel deliberate
+   near the end.
+   ════════════════════════════════════════════════════════════ */
+function runSelection(){
+  STATE='selecting';
+  const ids=[...fingers.keys()];
+  const n=ids.length;
+  if(n===0){ enterScreensaver(); return; }
+  if(n===1){ setTimeout(()=>enterWinner(ids[0]),400); return; } // solo = instant win
+
+  const winIdx = Math.floor(Math.random()*n); // winner chosen HERE, before any animation
+  const wid    = ids[winIdx];
+
+  // Build the step sequence: random phase + final lap ending on winner
+  const seq  = [];
+  const rand = MIN_STEPS + n*3;
+  for(let i=0;i<rand;i++) seq.push(Math.floor(Math.random()*n));
+
+  // Final lap: cycle [0,1,...,n-1] rotating until winIdx is last
+  const lap = Array.from({length:n},(_,i)=>i);
+  while(lap[lap.length-1]!==winIdx) lap.push(lap.shift());
+  seq.push(...lap);
+
+  let step=0, prev=-1;
+  function tick(){
+    if(step>=seq.length){
+      if(prev>=0) fingers.get(ids[prev])?.el.classList.remove('sel-hi');
+      setTimeout(()=>enterWinner(wid),300);
+      return;
+    }
+    const cur=seq[step];
+    if(prev>=0&&prev!==cur){
+      const pf=fingers.get(ids[prev]);
+      if(pf){ pf.el.classList.remove('sel-hi'); pf.el.style.filter=''; }
+    }
+    const cf=fingers.get(ids[cur]);
+    if(cf){ cf.el.classList.add('sel-hi'); cf.el.style.filter=`drop-shadow(0 0 14px ${cf.color})`; }
+    pingTick(step,seq.length);
+    prev=cur;
+    const p=step/seq.length;
+    step++;
+    setTimeout(tick, 38+Math.pow(p,2.5)*780); // exponential slowdown
+  }
+  tick();
+}
+
+/* ════════════════════════════════════════════════════════════
+   TOUCH & MOUSE HANDLERS
+   Touch events use {passive:false} so e.preventDefault() works
+   (required to suppress browser scroll/zoom while fingers are down).
+   Mouse handlers provide a desktop testing fallback — one "finger"
+   tracked via the string key 'mouse'.
+   ════════════════════════════════════════════════════════════ */
+function onTouchStart(e){
+  e.preventDefault(); getAudioCtx(); // unlock AudioContext on first gesture
+  if(STATE==='winner'){ clearTimeout(winTout); enterScreensaver(); return; }
+  if(STATE==='locked'||STATE==='selecting') return; // ignore touches during animation
+  if(STATE==='screensaver') enterCollecting();
+  Array.from(e.changedTouches).forEach(t=>{ addFinger(t.identifier,t.clientX,t.clientY); resetTimer(); updateCount(); });
+}
+function onTouchMove(e){
+  e.preventDefault();
+  if(STATE!=='collecting') return;
+  Array.from(e.changedTouches).forEach(t=>moveFinger(t.identifier,t.clientX,t.clientY));
+}
+function onTouchEnd(e){
+  e.preventDefault();
+  if(STATE==='locked'||STATE==='selecting'||STATE==='winner') return;
+  Array.from(e.changedTouches).forEach(t=>removeFinger(t.identifier));
+  if(STATE==='collecting'){
+    updateCount();
+    if(fingers.size===0){ stopTimer(); enterScreensaver(); }
+    else resetTimer();
+  }
+}
+function onTouchCancel(e){ onTouchEnd(e); }
+
+// Mouse fallback for desktop testing
+function onMouseDown(e){
+  getAudioCtx();
+  if(STATE==='winner'){ clearTimeout(winTout); enterScreensaver(); return; }
+  if(STATE==='locked'||STATE==='selecting') return;
+  if(STATE==='screensaver') enterCollecting();
+  mDown=true; addFinger('mouse',e.clientX,e.clientY); resetTimer(); updateCount();
+}
+function onMouseMove(e){ if(!mDown||STATE!=='collecting') return; moveFinger('mouse',e.clientX,e.clientY); }
+function onMouseUp(){
+  if(!mDown) return; mDown=false; removeFinger('mouse');
+  if(STATE==='collecting'){ updateCount(); if(fingers.size===0){stopTimer();enterScreensaver();}else resetTimer(); }
+}
+
+$layer.addEventListener('touchstart',  onTouchStart,  {passive:false});
+$layer.addEventListener('touchmove',   onTouchMove,   {passive:false});
+$layer.addEventListener('touchend',    onTouchEnd,    {passive:false});
+$layer.addEventListener('touchcancel', onTouchCancel, {passive:false});
+$layer.addEventListener('mousedown',   onMouseDown);
+window.addEventListener('mousemove',   onMouseMove);
+window.addEventListener('mouseup',     onMouseUp);
+
+/* ── SOUND TOGGLE ─── */
+// Flips soundEnabled and swaps the icon; no audio is produced on mute toggle
+// itself — silence is the most appropriate feedback for "I want silence."
+$sndBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  soundEnabled = !soundEnabled;
+  $sndBtn.classList.toggle('muted', !soundEnabled);
+  $sndOn.style.display  = soundEnabled ? '' : 'none';
+  $sndOff.style.display = soundEnabled ? 'none' : '';
+});
+
+/* ── PLAY AGAIN ─── */
+// Clears the auto-reset timeout and immediately drops back to screensaver.
+// stopPropagation so the tap doesn't also fire the winner-overlay touch handler.
+$wAgain.addEventListener('click', e => {
+  e.stopPropagation();
+  clearTimeout(winTout);
+  enterScreensaver();
+});
+
+/* ── FULLSCREEN ─── */
+const isIOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+document.addEventListener('fullscreenchange',()=>{
+  const full=!!document.fullscreenElement;
+  $fsExpand.style.display=full?'none':'';
+  $fsCompress.style.display=full?'':'none';
+});
+$fsBtn.addEventListener('click', async e=>{
+  e.stopPropagation();
+  if(isIOS){ $iosHint.classList.add('show'); setTimeout(()=>$iosHint.classList.remove('show'),4500); return; }
+  try {
+    if(!document.fullscreenElement) await ($app.requestFullscreen?.()||$app.webkitRequestFullscreen?.());
+    else await (document.exitFullscreen?.()||document.webkitExitFullscreen?.());
+  } catch(e){}
+});
+
+/* ── VISIBILITY CHANGE ─── */
+// When the browser backgrounds (phone call, notification, tab switch),
+// pause the countdown so it doesn't fire while no one is watching.
+// On return, reset timerLast so the delta-time calculation doesn't
+// see a huge gap and instantly drain the remaining timer.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    // Pause: simply stop ticking. timerLeft retains its value.
+    timerOn = false;
+  } else if (STATE === 'collecting' && fingers.size > 0) {
+    // Resume: re-anchor timerLast to now so the missed wall-clock
+    // time doesn't count against the players.
+    timerLast = performance.now();
+    timerOn   = true;
+  }
+});
+
+/* ════════════════════════════════════════════════════════════
+   RAF LOOP
+   Single requestAnimationFrame loop for the entire app.
+   dt is clamped to 50 ms to prevent the timer draining instantly
+   after a tab switch or CPU stall (the visibilitychange handler
+   also pauses timerOn, providing a second line of defense).
+   ════════════════════════════════════════════════════════════ */
+let lastT=performance.now();
+function loop(now){
+  const dt=Math.min(now-lastT,50); lastT=now;
+  if(STATE==='screensaver') tickGhosts(now,dt);
+  if(STATE==='collecting')  tickTimer(now);
+  requestAnimationFrame(loop);
+}
+
+enterScreensaver();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
